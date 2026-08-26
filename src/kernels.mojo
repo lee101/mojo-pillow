@@ -105,6 +105,7 @@ def mp_resample_horizontal(
     var bounds = ip(bounds_addr)
     var coeffs = ip(coeffs_addr)
     var workers = num_physical_cores() if dst_w * height >= PARALLEL_PIXELS else 1
+    comptime W = simd_width_of[DType.float64]()
 
     @parameter
     def process(worker: Int):
@@ -114,6 +115,25 @@ def mp_resample_horizontal(
             for x in range(dst_w):
                 var first = Int(bounds[x * 2])
                 var count = Int(bounds[x * 2 + 1])
+                if channels == W:
+                    var acc = SIMD[DType.int64, W](Int64(1 << 21))
+                    for k in range(count):
+                        var values = src.load[width=W](
+                            (y * src_w + first + k) * channels
+                        ).cast[DType.int64]()
+                        acc += values * SIMD[DType.int64, W](
+                            Int64(coeffs[x * kernel_size + k])
+                        )
+                    var shifted = acc >> 22
+                    var clipped = min(
+                        max(shifted, SIMD[DType.int64, W](0)),
+                        SIMD[DType.int64, W](255),
+                    )
+                    dst.store(
+                        (y * dst_w + x) * channels,
+                        clipped.cast[DType.uint8](),
+                    )
+                    continue
                 for c in range(channels):
                     var acc = Int64(1 << 21)
                     for k in range(count):
@@ -147,6 +167,7 @@ def mp_resample_vertical(
     var bounds = ip(bounds_addr)
     var coeffs = ip(coeffs_addr)
     var workers = num_physical_cores() if width * dst_h >= PARALLEL_PIXELS else 1
+    comptime W = simd_width_of[DType.float64]()
 
     @parameter
     def process(worker: Int):
@@ -155,15 +176,36 @@ def mp_resample_vertical(
         for y in range(y0, y1):
             var first = Int(bounds[y * 2])
             var count = Int(bounds[y * 2 + 1])
-            for x in range(width):
-                for c in range(channels):
-                    var acc = Int64(1 << 21)
-                    for k in range(count):
-                        acc += (
-                            Int64(src[((first + k) * width + x) * channels + c])
-                            * Int64(coeffs[y * kernel_size + k])
-                        )
-                    dst[(y * width + x) * channels + c] = clip_u8(Int(acc >> 22))
+            var row_bytes = width * channels
+            var vector_end = row_bytes - row_bytes % W
+            var i = 0
+            while i < vector_end:
+                var acc = SIMD[DType.int64, W](Int64(1 << 21))
+                for k in range(count):
+                    var values = src.load[width=W](
+                        (first + k) * row_bytes + i
+                    ).cast[DType.int64]()
+                    acc += values * SIMD[DType.int64, W](
+                        Int64(coeffs[y * kernel_size + k])
+                    )
+                var shifted = acc >> 22
+                var clipped = min(
+                    max(shifted, SIMD[DType.int64, W](0)),
+                    SIMD[DType.int64, W](255),
+                )
+                dst.store(
+                    y * row_bytes + i, clipped.cast[DType.uint8]()
+                )
+                i += W
+            while i < row_bytes:
+                var acc = Int64(1 << 21)
+                for k in range(count):
+                    acc += (
+                        Int64(src[(first + k) * row_bytes + i])
+                        * Int64(coeffs[y * kernel_size + k])
+                    )
+                dst[y * row_bytes + i] = clip_u8(Int(acc >> 22))
+                i += 1
 
     if workers > 1:
         prepare_runtime()
@@ -232,8 +274,8 @@ def mp_convert(
 
         @parameter
         def process_rgb_l(worker: Int):
-            var start = 0
-            var end = pixels
+            var start = worker * pixels // workers
+            var end = (worker + 1) * pixels // workers
             var vector_end = end - (end - start) % W
             var i = start
             while i < vector_end:
@@ -314,7 +356,11 @@ def mp_convert(
                 dst[i] = UInt8(luminance)
                 i += 1
 
-        process_rgb_l(0)
+        if workers > 1:
+            prepare_runtime()
+            parallelize[process_rgb_l](workers, workers)
+        else:
+            process_rgb_l(0)
         return
 
     @parameter
@@ -472,17 +518,33 @@ def mp_premultiply_rgba(
 ) abi("C"):
     var src = bp(src_addr)
     var dst = bp(dst_addr)
-    for i in range(pixels):
-        var source = i * channels
-        var alpha = Int(src[source + channels - 1])
-        for c in range(channels - 1):
-            if inverse == 0:
-                dst[source + c] = UInt8(div255(Int(src[source + c]) * alpha))
-            elif alpha == 0 or alpha == 255:
-                dst[source + c] = src[source + c]
-            else:
-                dst[source + c] = clip_u8(255 * Int(src[source + c]) // alpha)
-        dst[source + channels - 1] = src[source + channels - 1]
+    var workers = num_physical_cores() if pixels >= PARALLEL_PIXELS else 1
+
+    @parameter
+    def process(worker: Int):
+        var start = worker * pixels // workers
+        var end = (worker + 1) * pixels // workers
+        for i in range(start, end):
+            var source = i * channels
+            var alpha = Int(src[source + channels - 1])
+            for c in range(channels - 1):
+                if inverse == 0:
+                    dst[source + c] = UInt8(
+                        div255(Int(src[source + c]) * alpha)
+                    )
+                elif alpha == 0 or alpha == 255:
+                    dst[source + c] = src[source + c]
+                else:
+                    dst[source + c] = clip_u8(
+                        255 * Int(src[source + c]) // alpha
+                    )
+            dst[source + channels - 1] = src[source + channels - 1]
+
+    if workers > 1:
+        prepare_runtime()
+        parallelize[process](workers, workers)
+    else:
+        process(0)
 
 
 @export("mp_blend")

@@ -87,20 +87,22 @@ images and include output allocation and Python/ctypes overhead.
 
 | kernel | mojo-pillow | Pillow | speedup |
 | --- | ---: | ---: | ---: |
-| RGB bilinear resize 4K -> 1080p | 37.01 ms | 66.56 ms | 1.80x |
-| RGBA Lanczos resize 4K -> 1080p | 197.07 ms | 324.42 ms | 1.65x |
-| RGB SHARPEN convolution 4K | 66.72 ms | 276.41 ms | 4.14x |
-| RGB -> L conversion 4K | 5.79 ms | 9.42 ms | 1.63x |
-| RGB constant-alpha blend 4K | 10.06 ms | 21.73 ms | 2.16x |
-| RGBA alpha composite 4K | 20.58 ms | 90.89 ms | 4.42x |
+| RGB bilinear resize 4K -> 1080p | 22.47 ms | 66.20 ms | 2.95x |
+| RGBA Lanczos resize 4K -> 1080p | 63.81 ms | 256.80 ms | 4.02x |
+| RGB SHARPEN convolution 4K | 28.39 ms | 261.14 ms | 9.20x |
+| RGB -> L conversion 4K | 1.22 ms | 11.41 ms | 9.34x |
+| RGB constant-alpha blend 4K | 2.24 ms | 26.73 ms | 11.92x |
+| RGBA alpha composite 4K | 14.25 ms | 107.48 ms | 7.54x |
 
-All measured kernels are faster than Pillow on this dual-socket machine. The
-targeted RGB-to-L, blend, and alpha-composite kernels use SIMD with scalar
-remainder handling. Alpha compositing and large blends also split independent
-work above a size threshold; RGB-to-L remains serial because its memory-bound
-4K kernel was faster without thread-launch overhead.
+All measured kernels are faster than Pillow on this dual-socket machine.
+Resampling, RGB-to-L, blend, and alpha-composite use SIMD with scalar remainder
+handling. Large resampling, premultiplication, conversion, blending, and alpha
+compositing passes split independent work above a size threshold.
 
-There is no GPU path.
+There is no GPU path. The resize and conversion targets move enough source,
+coefficient, intermediate, and output data to stay below roughly two arithmetic
+operations per byte. Their CPU paths also avoid host/device copies, so GPU
+offload is not justified for these kernels.
 
 ## How it works
 

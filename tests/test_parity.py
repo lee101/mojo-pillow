@@ -279,6 +279,12 @@ def test_simd_tail_parity():
         Image.fromarray(rgb).convert("L"),
         PILImage.fromarray(rgb).convert("L"),
     )
+    assert_same(
+        Image.fromarray(rgb).resize((11, 5), Image.Resampling.LANCZOS),
+        PILImage.fromarray(rgb).resize(
+            (11, 5), PILImage.Resampling.LANCZOS
+        ),
+    )
     assert_u8_close(
         Image.blend(
             Image.fromarray(rgb), Image.fromarray(rgb_second), 0.35
@@ -319,6 +325,12 @@ def test_parallel_threshold_parity(shape):
         ),
         PILImage.alpha_composite(
             PILImage.fromarray(first_rgba), PILImage.fromarray(second_rgba)
+        ),
+    )
+    assert_same(
+        Image.fromarray(first_rgba).resize((257, 255), Image.Resampling.BILINEAR),
+        PILImage.fromarray(first_rgba).resize(
+            (257, 255), PILImage.Resampling.BILINEAR
         ),
     )
 

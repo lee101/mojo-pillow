@@ -324,11 +324,9 @@ class Image:
             )
             source = vertical
         if premultiplied:
-            result = np.empty_like(source)
             lib().mp_premultiply_rgba(
-                addr(source), addr(result), width * height, channels, 1
+                addr(source), addr(source), width * height, channels, 1
             )
-            source = result
         return Image(source, self.mode)
 
     def convert(
