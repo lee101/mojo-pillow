@@ -1,12 +1,18 @@
 """Pillow-compatible uint8 image kernels exposed through a C ABI."""
 
-from std.algorithm import parallelize
+from max.algorithm import parallelize
+from std.runtime import initialize_runtime
 from std.sys.info import num_physical_cores, simd_width_of
 
 comptime BPtr = UnsafePointer[UInt8, AnyOrigin[mut=True]]
 comptime IPtr = UnsafePointer[Int32, AnyOrigin[mut=True]]
 comptime FPtr = UnsafePointer[Float32, AnyOrigin[mut=True]]
 comptime PARALLEL_PIXELS = 262144
+
+
+@always_inline
+def prepare_runtime():
+    initialize_runtime()
 
 
 def bp(addr: Int) -> BPtr:
@@ -76,6 +82,7 @@ def mp_resize_nearest(
                     dst[target + c] = src[source + c]
 
     if workers > 1:
+        prepare_runtime()
         parallelize[process](workers, workers)
     else:
         process(0)
@@ -117,6 +124,7 @@ def mp_resample_horizontal(
                     dst[(y * dst_w + x) * channels + c] = clip_u8(Int(acc >> 22))
 
     if workers > 1:
+        prepare_runtime()
         parallelize[process](workers, workers)
     else:
         process(0)
@@ -158,6 +166,7 @@ def mp_resample_vertical(
                     dst[(y * width + x) * channels + c] = clip_u8(Int(acc >> 22))
 
     if workers > 1:
+        prepare_runtime()
         parallelize[process](workers, workers)
     else:
         process(0)
@@ -204,6 +213,7 @@ def mp_convolve(
                     dst[pixel + c] = clip_u8(Int(acc))
 
     if workers > 1:
+        prepare_runtime()
         parallelize[process](workers, workers)
     else:
         process(0)
@@ -413,6 +423,7 @@ def mp_convert(
                 dst[target + 3] = UInt8(255 - Int(src[i * source_step]))
 
     if workers > 1:
+        prepare_runtime()
         parallelize[process](workers, workers)
     else:
         process(0)
@@ -449,6 +460,7 @@ def mp_convert_matrix(
                 dst[i * dst_channels + c] = clip_u8(Int(value))
 
     if workers > 1:
+        prepare_runtime()
         parallelize[process](workers, workers)
     else:
         process(0)
@@ -516,6 +528,7 @@ def mp_blend(
             i += 1
 
     if workers > 1:
+        prepare_runtime()
         parallelize[process](workers, workers)
     else:
         process(0)
@@ -582,6 +595,7 @@ def mp_chop(
             dst[i] = clip_u8(value)
 
     if workers > 1:
+        prepare_runtime()
         parallelize[process](workers, workers)
     else:
         process(0)
@@ -698,6 +712,7 @@ def mp_alpha_composite_rgba(
             i += 1
 
     if workers > 1:
+        prepare_runtime()
         parallelize[process](workers, workers)
     else:
         process(0)
