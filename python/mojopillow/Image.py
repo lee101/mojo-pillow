@@ -9,7 +9,7 @@ from typing import BinaryIO, Sequence
 
 import numpy as np
 
-from ._lib import addr, lib, u8
+from ._lib import addr, convolve_rows, lib, u8
 
 
 class Resampling(IntEnum):
@@ -410,10 +410,10 @@ class Image:
         coefficients = np.ascontiguousarray(kernel_values, dtype=np.float32)
         coefficients /= np.float32(scale)
         result = np.empty_like(self._array)
-        lib().mp_convolve(
-            addr(self._array),
-            addr(result),
-            addr(coefficients),
+        convolve_rows(
+            coefficients,
+            self._array,
+            result,
             self.width,
             self.height,
             _CHANNELS[self.mode],

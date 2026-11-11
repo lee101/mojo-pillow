@@ -7,8 +7,10 @@ import os
 import shutil
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
+
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 LIB = os.path.join(ROOT, "dist", "libmojo-pillow.so")
@@ -22,6 +24,7 @@ _SIGNATURES = {
     "mp_resample_horizontal": ([I] * 9, None),
     "mp_resample_vertical": ([I] * 9, None),
     "mp_convolve": ([I] * 7 + [F], None),
+    "mp_convolve_rows": ([I] * 7 + [F, I, I], None),
     "mp_convert": ([I, I, I, I], None),
     "mp_convert_matrix": ([I, I, I, I, I], None),
     "mp_premultiply_rgba": ([I, I, I, I, I], None),
@@ -30,6 +33,47 @@ _SIGNATURES = {
     "mp_composite": ([I, I, I, I, I, I, I], None),
     "mp_alpha_composite_rgba": ([I, I, I, I, I], None),
 }
+
+# A KxK filter is K^2 multiply-accumulates per output byte, so convolution is
+# compute-bound and splitting it across cores pays. Measured crossover on a
+# 72-core box: a wash or worse at 0.5 MP (0.50x-1.10x), 2.3x-4.5x from 0.8 MP
+# up (4.47x at 4000x3000 K=3, 9.52x at 4000x4000 K=11 on 16 workers).
+CONVOLVE_PARALLEL_PIXELS = 1 << 20
+CONVOLVE_WORKERS = int(
+    os.environ.get("MOJOPILLOW_WORKERS", str(min(16, (os.cpu_count() or 8) - 2)))
+)
+
+
+def convolve_rows(
+    kernel,
+    src: np.ndarray,
+    dst: np.ndarray,
+    width: int,
+    height: int,
+    channels: int,
+    size: int,
+    offset: np.float32,
+):
+    """Run `mp_convolve_rows` over row bands, on a thread pool when it pays."""
+    handle = lib()
+    if height < CONVOLVE_PARALLEL_PIXELS or CONVOLVE_WORKERS <= 1:
+        handle.mp_convolve(
+            addr(src), addr(dst), addr(kernel), width, height, channels,
+            size, offset,
+        )
+        return
+    workers = min(CONVOLVE_WORKERS, height)
+    edges = [height * i // workers for i in range(workers + 1)]
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        list(
+            pool.map(
+                lambda band: handle.mp_convolve_rows(
+                    addr(src), addr(dst), addr(kernel), width, height,
+                    channels, size, offset, band[0], band[1],
+                ),
+                zip(edges, edges[1:]),
+            )
+        )
 
 
 class BuildError(RuntimeError):

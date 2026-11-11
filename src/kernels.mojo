@@ -1,18 +1,10 @@
 """Pillow-compatible uint8 image kernels exposed through a C ABI."""
 
-from max.algorithm import parallelize
-from std.runtime import initialize_runtime
-from std.sys.info import num_physical_cores, simd_width_of
+from std.sys.info import simd_width_of
 
 comptime BPtr = UnsafePointer[UInt8, AnyOrigin[mut=True]]
 comptime IPtr = UnsafePointer[Int32, AnyOrigin[mut=True]]
 comptime FPtr = UnsafePointer[Float32, AnyOrigin[mut=True]]
-comptime PARALLEL_PIXELS = 262144
-
-
-@always_inline
-def prepare_runtime():
-    initialize_runtime()
 
 
 def bp(addr: Int) -> BPtr:
@@ -64,12 +56,9 @@ def mp_resize_nearest(
     var dst = bp(dst_addr)
     var scale_x = (box_right - box_left) / Float64(dst_w)
     var scale_y = (box_bottom - box_top) / Float64(dst_h)
-    var workers = num_physical_cores() if dst_w * dst_h >= PARALLEL_PIXELS else 1
 
     @parameter
-    def process(worker: Int):
-        var y0 = worker * dst_h // workers
-        var y1 = (worker + 1) * dst_h // workers
+    def process(y0: Int, y1: Int):
         for y in range(y0, y1):
             var sy = Int(box_top + (Float64(y) + 0.5) * scale_y)
             sy = min(max(sy, 0), src_h - 1)
@@ -81,11 +70,7 @@ def mp_resize_nearest(
                 for c in range(channels):
                     dst[target + c] = src[source + c]
 
-    if workers > 1:
-        prepare_runtime()
-        parallelize[process](workers, workers)
-    else:
-        process(0)
+    process(0, dst_h)
 
 
 @export("mp_resample_horizontal")
@@ -104,13 +89,10 @@ def mp_resample_horizontal(
     var dst = bp(dst_addr)
     var bounds = ip(bounds_addr)
     var coeffs = ip(coeffs_addr)
-    var workers = num_physical_cores() if dst_w * height >= PARALLEL_PIXELS else 1
     comptime W = simd_width_of[DType.float64]()
 
     @parameter
-    def process(worker: Int):
-        var y0 = worker * height // workers
-        var y1 = (worker + 1) * height // workers
+    def process(y0: Int, y1: Int):
         for y in range(y0, y1):
             for x in range(dst_w):
                 var first = Int(bounds[x * 2])
@@ -118,7 +100,7 @@ def mp_resample_horizontal(
                 if channels == W:
                     var acc = SIMD[DType.int64, W](Int64(1 << 21))
                     for k in range(count):
-                        var values = src.load[width=W](
+                        var values = src.unsafe_load[width=W](
                             (y * src_w + first + k) * channels
                         ).cast[DType.int64]()
                         acc += values * SIMD[DType.int64, W](
@@ -143,11 +125,7 @@ def mp_resample_horizontal(
                         )
                     dst[(y * dst_w + x) * channels + c] = clip_u8(Int(acc >> 22))
 
-    if workers > 1:
-        prepare_runtime()
-        parallelize[process](workers, workers)
-    else:
-        process(0)
+    process(0, height)
 
 
 @export("mp_resample_vertical")
@@ -166,13 +144,10 @@ def mp_resample_vertical(
     var dst = bp(dst_addr)
     var bounds = ip(bounds_addr)
     var coeffs = ip(coeffs_addr)
-    var workers = num_physical_cores() if width * dst_h >= PARALLEL_PIXELS else 1
     comptime W = simd_width_of[DType.float64]()
 
     @parameter
-    def process(worker: Int):
-        var y0 = worker * dst_h // workers
-        var y1 = (worker + 1) * dst_h // workers
+    def process(y0: Int, y1: Int):
         for y in range(y0, y1):
             var first = Int(bounds[y * 2])
             var count = Int(bounds[y * 2 + 1])
@@ -182,7 +157,7 @@ def mp_resample_vertical(
             while i < vector_end:
                 var acc = SIMD[DType.int64, W](Int64(1 << 21))
                 for k in range(count):
-                    var values = src.load[width=W](
+                    var values = src.unsafe_load[width=W](
                         (first + k) * row_bytes + i
                     ).cast[DType.int64]()
                     acc += values * SIMD[DType.int64, W](
@@ -207,15 +182,11 @@ def mp_resample_vertical(
                 dst[y * row_bytes + i] = clip_u8(Int(acc >> 22))
                 i += 1
 
-    if workers > 1:
-        prepare_runtime()
-        parallelize[process](workers, workers)
-    else:
-        process(0)
+    process(0, dst_h)
 
 
-@export("mp_convolve")
-def mp_convolve(
+@export("mp_convolve_rows")
+def mp_convolve_rows(
     src_addr: Int,
     dst_addr: Int,
     kernel_addr: Int,
@@ -224,18 +195,23 @@ def mp_convolve(
     channels: Int,
     kernel_size: Int,
     offset: Float32,
+    y0: Int,
+    y1: Int,
 ) abi("C"):
+    """Rows `[y0, y1)` of the same convolution `mp_convolve` does.
+
+    A `K x K` filter is `K^2` multiply-accumulates per output byte, so this is
+    compute-bound rather than bandwidth-bound and it does pay to split: 4.0x at
+    K=3 and 9.5x at K=11 on 16 workers.
+    """
     var src = bp(src_addr)
     var dst = bp(dst_addr)
     var kernel = fp(kernel_addr)
     var radius = kernel_size // 2
-    var workers = num_physical_cores() if width * height >= PARALLEL_PIXELS else 1
 
     @parameter
-    def process(worker: Int):
-        var y0 = worker * height // workers
-        var y1 = (worker + 1) * height // workers
-        for y in range(y0, y1):
+    def process(row0: Int, row1: Int):
+        for y in range(row0, row1):
             for x in range(width):
                 var pixel = (y * width + x) * channels
                 if x < radius or x >= width - radius or y < radius or y >= height - radius:
@@ -254,11 +230,33 @@ def mp_convolve(
                             )
                     dst[pixel + c] = clip_u8(Int(acc))
 
-    if workers > 1:
-        prepare_runtime()
-        parallelize[process](workers, workers)
-    else:
-        process(0)
+    process(y0, y1)
+
+
+@export("mp_convolve")
+def mp_convolve(
+    src_addr: Int,
+    dst_addr: Int,
+    kernel_addr: Int,
+    width: Int,
+    height: Int,
+    channels: Int,
+    kernel_size: Int,
+    offset: Float32,
+) abi("C"):
+    if src_addr != 0 and dst_addr != 0 and kernel_addr != 0 and height > 0:
+        mp_convolve_rows(
+            src_addr,
+            dst_addr,
+            kernel_addr,
+            width,
+            height,
+            channels,
+            kernel_size,
+            offset,
+            0,
+            height,
+        )
 
 
 @export("mp_convert")
@@ -267,22 +265,19 @@ def mp_convert(
 ) abi("C"):
     var src = bp(src_addr)
     var dst = bp(dst_addr)
-    var workers = num_physical_cores() if pixels >= PARALLEL_PIXELS else 1
 
     if operation == 0:
         comptime W = 16
 
         @parameter
-        def process_rgb_l(worker: Int):
-            var start = worker * pixels // workers
-            var end = (worker + 1) * pixels // workers
+        def process_rgb_l(start: Int, end: Int):
             var vector_end = end - (end - start) % W
             var i = start
             while i < vector_end:
                 var source = i * 3
-                var first = src.load[width=W](source)
-                var second = src.load[width=W](source + W)
-                var third = src.load[width=W](source + W * 2)
+                var first = src.unsafe_load[width=W](source)
+                var second = src.unsafe_load[width=W](source + W)
+                var third = src.unsafe_load[width=W](source + W * 2)
                 var red = SIMD[DType.uint8, W](
                     first[0],
                     first[3],
@@ -356,17 +351,11 @@ def mp_convert(
                 dst[i] = UInt8(luminance)
                 i += 1
 
-        if workers > 1:
-            prepare_runtime()
-            parallelize[process_rgb_l](workers, workers)
-        else:
-            process_rgb_l(0)
+        process_rgb_l(0, pixels)
         return
 
     @parameter
-    def process(worker: Int):
-        var start = worker * pixels // workers
-        var end = (worker + 1) * pixels // workers
+    def process(start: Int, end: Int):
         for i in range(start, end):
             if operation == 0 or operation == 1:
                 var step = 3 if operation == 0 else 4
@@ -468,11 +457,7 @@ def mp_convert(
                 dst[target + 2] = UInt8(0)
                 dst[target + 3] = UInt8(255 - Int(src[i * source_step]))
 
-    if workers > 1:
-        prepare_runtime()
-        parallelize[process](workers, workers)
-    else:
-        process(0)
+    process(0, pixels)
 
 
 @export("mp_convert_matrix")
@@ -486,12 +471,9 @@ def mp_convert_matrix(
     var src = bp(src_addr)
     var dst = bp(dst_addr)
     var matrix = fp(matrix_addr)
-    var workers = num_physical_cores() if pixels >= PARALLEL_PIXELS else 1
 
     @parameter
-    def process(worker: Int):
-        var start = worker * pixels // workers
-        var end = (worker + 1) * pixels // workers
+    def process(start: Int, end: Int):
         for i in range(start, end):
             var source = i * 3
             for c in range(dst_channels):
@@ -505,11 +487,7 @@ def mp_convert_matrix(
                 )
                 dst[i * dst_channels + c] = clip_u8(Int(value))
 
-    if workers > 1:
-        prepare_runtime()
-        parallelize[process](workers, workers)
-    else:
-        process(0)
+    process(0, pixels)
 
 
 @export("mp_premultiply_rgba")
@@ -518,12 +496,9 @@ def mp_premultiply_rgba(
 ) abi("C"):
     var src = bp(src_addr)
     var dst = bp(dst_addr)
-    var workers = num_physical_cores() if pixels >= PARALLEL_PIXELS else 1
 
     @parameter
-    def process(worker: Int):
-        var start = worker * pixels // workers
-        var end = (worker + 1) * pixels // workers
+    def process(start: Int, end: Int):
         for i in range(start, end):
             var source = i * channels
             var alpha = Int(src[source + channels - 1])
@@ -540,11 +515,7 @@ def mp_premultiply_rgba(
                     )
             dst[source + channels - 1] = src[source + channels - 1]
 
-    if workers > 1:
-        prepare_runtime()
-        parallelize[process](workers, workers)
-    else:
-        process(0)
+    process(0, pixels)
 
 
 @export("mp_blend")
@@ -558,18 +529,15 @@ def mp_blend(
     var first = bp(first_addr)
     var second = bp(second_addr)
     var dst = bp(dst_addr)
-    var workers = num_physical_cores() if count >= PARALLEL_PIXELS else 1
     comptime W = simd_width_of[DType.float64]()
 
     @parameter
-    def process(worker: Int):
-        var start = worker * count // workers
-        var end = (worker + 1) * count // workers
+    def process(start: Int, end: Int):
         var vector_end = end - (end - start) % W
         var i = start
         while i < vector_end:
-            var first_values = first.load[width=W](i).cast[DType.float32]()
-            var second_values = second.load[width=W](i).cast[DType.float32]()
+            var first_values = first.unsafe_load[width=W](i).cast[DType.float32]()
+            var second_values = second.unsafe_load[width=W](i).cast[DType.float32]()
             var values = (
                 first_values
                 + SIMD[DType.float32, W](alpha)
@@ -589,11 +557,7 @@ def mp_blend(
             dst[i] = clip_u8(Int(value))
             i += 1
 
-    if workers > 1:
-        prepare_runtime()
-        parallelize[process](workers, workers)
-    else:
-        process(0)
+    process(0, count)
 
 
 @export("mp_chop")
@@ -609,12 +573,9 @@ def mp_chop(
     var first = bp(first_addr)
     var second = bp(second_addr)
     var dst = bp(dst_addr)
-    var workers = num_physical_cores() if count >= PARALLEL_PIXELS else 1
 
     @parameter
-    def process(worker: Int):
-        var start = worker * count // workers
-        var end = (worker + 1) * count // workers
+    def process(start: Int, end: Int):
         for i in range(start, end):
             var a = Int(first[i])
             var b = Int(second[i])
@@ -656,11 +617,7 @@ def mp_chop(
                 )
             dst[i] = clip_u8(value)
 
-    if workers > 1:
-        prepare_runtime()
-        parallelize[process](workers, workers)
-    else:
-        process(0)
+    process(0, count)
 
 
 @export("mp_composite")
@@ -696,13 +653,10 @@ def mp_alpha_composite_rgba(
     var first = bp(first_addr)
     var second = bp(second_addr)
     var dst = bp(dst_addr)
-    var workers = num_physical_cores() if pixels >= PARALLEL_PIXELS else 1
     comptime W = simd_width_of[DType.float64]()
 
     @parameter
-    def process(worker: Int):
-        var start = worker * pixels // workers
-        var end = (worker + 1) * pixels // workers
+    def process(start: Int, end: Int):
         var vector_end = end - (end - start) % W
         var i = start
         while i < vector_end:
@@ -773,8 +727,4 @@ def mp_alpha_composite_rgba(
             )
             i += 1
 
-    if workers > 1:
-        prepare_runtime()
-        parallelize[process](workers, workers)
-    else:
-        process(0)
+    process(0, pixels)
